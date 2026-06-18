@@ -1,0 +1,65 @@
+/**
+ * Styles for the Goodreads book grid.
+ *
+ * @package Goodreads_RSS_Widget
+ * @since   1.0.0
+ */
+
+.goodreads-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+	gap: 12px;
+}
+
+.goodreads-item {
+	background: transparent;
+}
+
+.goodreads-cover-link {
+	text-decoration: none;
+	display: block;
+}
+
+.goodreads-cover {
+	display: block;
+	max-width: 100%;
+	height: auto;
+	border-radius: 4px;
+	box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+
+.goodreads-title {
+	margin: 8px 0 0;
+	font-size: 0.95rem;
+	line-height: 1.25;
+}
+
+.goodreads-title a {
+	text-decoration: none;
+}
+
+.goodreads-author {
+	margin: 4px 0 0;
+	font-size: 0.85rem;
+	opacity: 0.9;
+}
+
+.goodreads-year {
+	margin: 2px 0 0;
+	font-size: 0.82rem;
+	opacity: 0.8;
+}
+
+.goodreads-rating {
+	margin-top: 6px;
+	font-size: 1rem;
+	color: #d4a017;
+	letter-spacing: 0.5px;
+}
+
+.goodreads-error {
+	padding: 10px 12px;
+	background: #fff3cd;
+	border: 1px solid #ffeeba;
+	border-radius: 6px;
+}
