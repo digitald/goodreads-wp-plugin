@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       Goodreads RSS Widget
  * Plugin URI:        https://github.com/digitald/Goodreads_wp_plugin
- * Description:       Mostra i libri da uno scaffale Goodreads tramite feed RSS con titolo, autore, anno, copertina e valutazione.
- * Version:           1.0.0
+ * Description:       Mostra i libri di uno scaffale Goodreads pubblico con titolo, autore, copertina e valutazione.
+ * Version:           1.1.0
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            digitald
@@ -21,7 +21,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /** Plugin version. */
-define( 'GOODREADS_RSS_WIDGET_VERSION', '1.0.0' );
+define( 'GOODREADS_RSS_WIDGET_VERSION', '1.1.0' );
 
 /** Absolute path to the main plugin file. */
 define( 'GOODREADS_RSS_WIDGET_FILE', __FILE__ );
@@ -38,8 +38,8 @@ define( 'GOODREADS_RSS_WIDGET_MIN_COUNT', 1 );
 /** Maximum number of books per shortcode request. */
 define( 'GOODREADS_RSS_WIDGET_MAX_COUNT', 50 );
 
-/** Feed cache lifetime in seconds. */
-define( 'GOODREADS_RSS_WIDGET_CACHE_SECONDS', HOUR_IN_SECONDS );
+/** Successful shelf cache lifetime in seconds. */
+define( 'GOODREADS_RSS_WIDGET_CACHE_SECONDS', DAY_IN_SECONDS );
 
 require_once GOODREADS_RSS_WIDGET_PATH . 'includes/class-feed.php';
 require_once GOODREADS_RSS_WIDGET_PATH . 'includes/class-shortcode.php';
@@ -142,8 +142,11 @@ function goodreads_rss_widget_bootstrap() {
  */
 class Goodreads_Admin {
 
-	/** @var string Option name for the Goodreads RSS feed URL. */
-	const OPT_FEED_URL = 'goodreads_feed_url';
+	/** @var string Option name for the numeric Goodreads user id. */
+	const OPT_USER_ID = 'goodreads_user_id';
+
+	/** @var string Option name for the shelf slug. */
+	const OPT_SHELF = 'goodreads_shelf';
 
 	/** @var string Option name for the default book count. */
 	const OPT_COUNT = 'goodreads_default_count';
@@ -173,11 +176,21 @@ class Goodreads_Admin {
 	public static function register_settings() {
 		register_setting(
 			'goodreads_rss_widget',
-			self::OPT_FEED_URL,
+			self::OPT_USER_ID,
 			array(
 				'type'              => 'string',
-				'sanitize_callback' => array( __CLASS__, 'sanitize_feed_url' ),
+				'sanitize_callback' => array( __CLASS__, 'sanitize_user_id' ),
 				'default'           => '',
+			)
+		);
+
+		register_setting(
+			'goodreads_rss_widget',
+			self::OPT_SHELF,
+			array(
+				'type'              => 'string',
+				'sanitize_callback' => array( __CLASS__, 'sanitize_shelf' ),
+				'default'           => 'read',
 			)
 		);
 
@@ -199,9 +212,17 @@ class Goodreads_Admin {
 		);
 
 		add_settings_field(
-			self::OPT_FEED_URL,
-			__( 'URL feed RSS', 'goodreads-rss-widget' ),
-			array( __CLASS__, 'render_feed_url_field' ),
+			self::OPT_USER_ID,
+			__( 'Profilo Goodreads', 'goodreads-rss-widget' ),
+			array( __CLASS__, 'render_user_id_field' ),
+			'goodreads-rss-widget',
+			'goodreads_rss_widget_main'
+		);
+
+		add_settings_field(
+			self::OPT_SHELF,
+			__( 'Scaffale', 'goodreads-rss-widget' ),
+			array( __CLASS__, 'render_shelf_field' ),
 			'goodreads-rss-widget',
 			'goodreads_rss_widget_main'
 		);
@@ -223,7 +244,7 @@ class Goodreads_Admin {
 	 */
 	public static function render_settings_section() {
 		echo '<p>' . esc_html__(
-			'Incolla l\'URL RSS completo del tuo scaffale Goodreads. L\'URL contiene una chiave privata: non condividerlo pubblicamente.',
+			'Indica il tuo profilo Goodreads e lo scaffale da mostrare. Il profilo deve essere pubblico: Goodreads non espone più i feed RSS, nemmeno con la vecchia chiave.',
 			'goodreads-rss-widget'
 		) . '</p>';
 	}
@@ -239,7 +260,7 @@ class Goodreads_Admin {
 			return;
 		}
 
-		$feed_url = (string) get_option( self::OPT_FEED_URL, '' );
+		$settings = Goodreads_Feed::resolve_settings();
 		$count    = (int) get_option( self::OPT_COUNT, 10 );
 
 		?>
@@ -252,7 +273,7 @@ class Goodreads_Admin {
 				submit_button();
 				?>
 			</form>
-			<?php self::render_help( $feed_url, $count ); ?>
+			<?php self::render_help( $settings, $count ); ?>
 		</div>
 		<?php
 	}
@@ -262,37 +283,40 @@ class Goodreads_Admin {
 	 *
 	 * @since 1.0.0
 	 *
-	 * @param string $feed_url Saved feed URL.
-	 * @param int    $count    Saved default book count.
+	 * @param array{user_id:string,shelf:string} $settings Saved profile and shelf.
+	 * @param int                                $count    Saved default book count.
 	 * @return void
 	 */
-	private static function render_help( $feed_url, $count ) {
+	private static function render_help( $settings, $count ) {
 		$count = max( GOODREADS_RSS_WIDGET_MIN_COUNT, min( GOODREADS_RSS_WIDGET_MAX_COUNT, $count ) );
+		$shelf = isset( $settings['shelf'] ) ? (string) $settings['shelf'] : 'read';
 
 		$shortcode_default = '[goodreads]';
 		$shortcode_count   = '[goodreads count="' . $count . '"]';
+		$shortcode_shelf   = '[goodreads shelf="' . $shelf . '" count="' . $count . '"]';
 
 		?>
 		<div class="card" style="max-width: 720px; margin-top: 20px; padding: 16px 20px;">
 			<h2 style="margin-top: 0;"><?php esc_html_e( 'Come usarlo', 'goodreads-rss-widget' ); ?></h2>
 			<p><?php esc_html_e( 'Inserisci uno shortcode in una pagina, un articolo o un widget per mostrare i libri dal tuo scaffale Goodreads.', 'goodreads-rss-widget' ); ?></p>
 
-			<h3><?php esc_html_e( 'Dove trovare l\'URL RSS', 'goodreads-rss-widget' ); ?></h3>
+			<h3><?php esc_html_e( 'Dove trovare ID e scaffale', 'goodreads-rss-widget' ); ?></h3>
 			<ol>
-				<li><?php esc_html_e( 'Accedi a Goodreads e vai su My Books.', 'goodreads-rss-widget' ); ?></li>
-				<li><?php esc_html_e( 'Apri lo scaffale che vuoi mostrare (es. currently-reading, read, to-read).', 'goodreads-rss-widget' ); ?></li>
-				<li><?php esc_html_e( 'In basso a sinistra clicca su RSS.', 'goodreads-rss-widget' ); ?></li>
-				<li><?php esc_html_e( 'Copia l\'URL completo e incollalo nel campo sopra.', 'goodreads-rss-widget' ); ?></li>
+				<li><?php esc_html_e( 'Apri il tuo profilo Goodreads.', 'goodreads-rss-widget' ); ?></li>
+				<li><?php esc_html_e( 'L\'ID è il numero nell\'indirizzo, ad esempio goodreads.com/user/show/12345678-nome.', 'goodreads-rss-widget' ); ?></li>
+				<li><?php esc_html_e( 'Lo scaffale è lo slug visibile nei tuoi libri: read, currently-reading, to-read, oppure il nome di uno scaffale personalizzato.', 'goodreads-rss-widget' ); ?></li>
+				<li><?php esc_html_e( 'Il profilo deve essere pubblico. Un profilo privato non è leggibile.', 'goodreads-rss-widget' ); ?></li>
 			</ol>
 
 			<h3><?php esc_html_e( 'Shortcode', 'goodreads-rss-widget' ); ?></h3>
 			<p><?php esc_html_e( 'Usa i valori salvati sopra:', 'goodreads-rss-widget' ); ?></p>
 			<p><code><?php echo esc_html( $shortcode_default ); ?></code></p>
 
-			<p><?php esc_html_e( 'Sovrascrivi solo il numero di libri:', 'goodreads-rss-widget' ); ?></p>
+			<p><?php esc_html_e( 'Sovrascrivi il numero di libri:', 'goodreads-rss-widget' ); ?></p>
 			<p><code><?php echo esc_html( $shortcode_count ); ?></code></p>
 
-			<p><em><?php esc_html_e( 'Per sicurezza, lo shortcode non accetta l\'URL RSS come attributo.', 'goodreads-rss-widget' ); ?></em></p>
+			<p><?php esc_html_e( 'Sovrascrivi scaffale e numero:', 'goodreads-rss-widget' ); ?></p>
+			<p><code><?php echo esc_html( $shortcode_shelf ); ?></code></p>
 
 			<h3><?php esc_html_e( 'Widget (sidebar / footer)', 'goodreads-rss-widget' ); ?></h3>
 			<ol>
@@ -303,33 +327,61 @@ class Goodreads_Admin {
 
 			<h3><?php esc_html_e( 'Limiti e compatibilità', 'goodreads-rss-widget' ); ?></h3>
 			<ul>
-				<li><?php esc_html_e( 'Richiede un URL RSS Goodreads valido con parametro key.', 'goodreads-rss-widget' ); ?></li>
+				<li><?php esc_html_e( 'Richiede un profilo Goodreads pubblico.', 'goodreads-rss-widget' ); ?></li>
 				<li><?php printf( esc_html__( 'Numero libri visualizzabili: da %1$d a %2$d per shortcode.', 'goodreads-rss-widget' ), GOODREADS_RSS_WIDGET_MIN_COUNT, GOODREADS_RSS_WIDGET_MAX_COUNT ); ?></li>
-				<li><?php esc_html_e( 'Le stelline mostrano solo la tua valutazione (user_rating); se è 0, non vengono mostrate.', 'goodreads-rss-widget' ); ?></li>
-				<li><?php esc_html_e( 'Cache del feed: 1 ora.', 'goodreads-rss-widget' ); ?></li>
+				<li><?php esc_html_e( 'Le stelline mostrano solo la tua valutazione; se è assente, non vengono mostrate.', 'goodreads-rss-widget' ); ?></li>
+				<li><?php esc_html_e( 'L\'anno di pubblicazione non è più disponibile.', 'goodreads-rss-widget' ); ?></li>
+				<li><?php esc_html_e( 'Cache dello scaffale: 24 ore.', 'goodreads-rss-widget' ); ?></li>
 				<li><?php esc_html_e( 'Compatibile con WordPress 5.8+ e PHP 7.4+.', 'goodreads-rss-widget' ); ?></li>
 			</ul>
 
-			<h3><?php esc_html_e( 'Sicurezza', 'goodreads-rss-widget' ); ?></h3>
-			<p><?php esc_html_e( 'L\'URL RSS contiene una chiave segreta. Non inserirlo in pagine pubbliche, shortcode o widget visibili agli editori non fidati.', 'goodreads-rss-widget' ); ?></p>
-			<?php if ( Goodreads_Feed::validate_feed_url( $feed_url ) !== '' ) : ?>
-				<p><?php esc_html_e( 'Feed configurato (chiave mascherata):', 'goodreads-rss-widget' ); ?></p>
-				<p><code><?php echo esc_html( Goodreads_Feed::redact_feed_url( $feed_url ) ); ?></code></p>
+			<?php if ( ! empty( $settings['user_id'] ) ) : ?>
+				<p><?php esc_html_e( 'Profilo configurato:', 'goodreads-rss-widget' ); ?></p>
+				<p><code><?php echo esc_html( 'https://www.goodreads.com/user/show/' . $settings['user_id'] ); ?></code></p>
 			<?php endif; ?>
 		</div>
 		<?php
 	}
 
 	/**
-	 * Sanitizes the Goodreads RSS feed URL option.
+	 * Sanitizes the Goodreads user id option.
 	 *
-	 * @since 1.0.0
+	 * A pasted profile URL or legacy RSS URL is reduced to the numeric id.
+	 * Saving drops the old RSS URL so its secret key does not stay in the database.
+	 *
+	 * @since 1.1.0
 	 *
 	 * @param mixed $value Raw option value.
 	 * @return string
 	 */
-	public static function sanitize_feed_url( $value ) {
-		return Goodreads_Feed::validate_feed_url( (string) $value );
+	public static function sanitize_user_id( $value ) {
+		$parsed = Goodreads_Feed::parse_profile_input( (string) $value );
+		delete_option( Goodreads_Feed::OPT_LEGACY_FEED_URL );
+		return $parsed['id'];
+	}
+
+	/**
+	 * Sanitizes the shelf slug option.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @param mixed $value Raw option value.
+	 * @return string
+	 */
+	public static function sanitize_shelf( $value ) {
+		$shelf = Goodreads_Feed::sanitize_shelf( (string) $value );
+		if ( $shelf !== '' ) {
+			return $shelf;
+		}
+
+		if ( isset( $_POST[ self::OPT_USER_ID ] ) ) {
+			$parsed = Goodreads_Feed::parse_profile_input( (string) wp_unslash( $_POST[ self::OPT_USER_ID ] ) );
+			if ( $parsed['shelf'] !== '' ) {
+				return $parsed['shelf'];
+			}
+		}
+
+		return 'read';
 	}
 
 	/**
@@ -352,19 +404,37 @@ class Goodreads_Admin {
 	}
 
 	/**
-	 * Renders the feed URL settings field.
+	 * Renders the Goodreads profile field.
 	 *
-	 * @since 1.0.0
+	 * @since 1.1.0
 	 * @return void
 	 */
-	public static function render_feed_url_field() {
-		$value = (string) get_option( self::OPT_FEED_URL, '' );
+	public static function render_user_id_field() {
+		$settings = Goodreads_Feed::resolve_settings();
 		printf(
-			'<input type="url" name="%1$s" value="%2$s" class="large-text code" placeholder="%3$s" autocomplete="off" />',
-			esc_attr( self::OPT_FEED_URL ),
-			esc_attr( $value ),
-			esc_attr__( 'https://www.goodreads.com/review/list_rss/...', 'goodreads-rss-widget' )
+			'<input type="text" name="%1$s" value="%2$s" class="regular-text code" placeholder="%3$s" autocomplete="off" />',
+			esc_attr( self::OPT_USER_ID ),
+			esc_attr( $settings['user_id'] ),
+			esc_attr__( '12345678 oppure https://www.goodreads.com/user/show/12345678', 'goodreads-rss-widget' )
 		);
+		echo '<p class="description">' . esc_html__( 'Numero del profilo, URL del profilo, oppure il vecchio URL RSS: in quel caso viene usato solo l\'ID.', 'goodreads-rss-widget' ) . '</p>';
+	}
+
+	/**
+	 * Renders the shelf slug field.
+	 *
+	 * @since 1.1.0
+	 * @return void
+	 */
+	public static function render_shelf_field() {
+		$settings = Goodreads_Feed::resolve_settings();
+		printf(
+			'<input type="text" name="%1$s" value="%2$s" class="regular-text code" placeholder="%3$s" />',
+			esc_attr( self::OPT_SHELF ),
+			esc_attr( $settings['shelf'] ),
+			esc_attr__( 'read', 'goodreads-rss-widget' )
+		);
+		echo '<p class="description">' . esc_html__( 'Esempi: read, currently-reading, to-read.', 'goodreads-rss-widget' ) . '</p>';
 	}
 
 	/**

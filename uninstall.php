@@ -11,6 +11,8 @@ if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
 }
 
 delete_option( 'goodreads_feed_url' );
+delete_option( 'goodreads_user_id' );
+delete_option( 'goodreads_shelf' );
 delete_option( 'goodreads_default_count' );
 
 global $wpdb;

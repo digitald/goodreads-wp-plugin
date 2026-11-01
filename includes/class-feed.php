@@ -1,6 +1,10 @@
 <?php
 /**
- * Fetches and parses the Goodreads bookshelf RSS feed.
+ * Fetches a public Goodreads shelf from the official shelf widget.
+ *
+ * Goodreads removed RSS in October 2026. The shelf widget at
+ * /review/custom_widget/{user_id} is still the embed Goodreads serves
+ * for external sites, and it includes title, author, cover and rating.
  *
  * @package Goodreads_RSS_Widget
  * @since   1.0.0
@@ -11,17 +15,61 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Handles feed URL validation, remote retrieval, caching, and parsing.
+ * Handles profile validation, widget retrieval, caching, and parsing.
  *
  * @since 1.0.0
  */
 class Goodreads_Feed {
+
+	/** @var string Option name for the numeric Goodreads user id. */
+	const OPT_USER_ID = 'goodreads_user_id';
+
+	/** @var string Option name for the shelf slug. */
+	const OPT_SHELF = 'goodreads_shelf';
+
+	/** @var string Option name for the default book count. */
+	const OPT_COUNT = 'goodreads_default_count';
+
+	/** @var string Legacy option that stored the RSS URL, including its secret key. */
+	const OPT_LEGACY_FEED_URL = 'goodreads_feed_url';
 
 	/** @var string Prefix for WordPress transient cache keys. */
 	private const TRANSIENT_PREFIX = 'goodreads_feed_';
 
 	/** @var string Allowed Goodreads hostnames. */
 	private const ALLOWED_HOSTS = array( 'www.goodreads.com', 'goodreads.com' );
+
+	/**
+	 * Builds a numeric widget id.
+	 *
+	 * Goodreads remembers the first query it sees for a widget id and then
+	 * ignores later changes to shelf or book count. The id therefore has to
+	 * change whenever those parameters change.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @param string $shelf Valid shelf slug.
+	 * @return string
+	 */
+	private static function widget_id( $shelf ) {
+		$sort = self::shelf_sort( $shelf );
+		$seed = $shelf . '|' . $sort . '|' . GOODREADS_RSS_WIDGET_MAX_COUNT . '|v1';
+		$hash = sprintf( '%u', crc32( $seed ) );
+
+		return (string) ( 100000000 + ( (int) $hash % 800000000 ) );
+	}
+
+	/**
+	 * Chooses the widget sort for a shelf.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @param string $shelf Valid shelf slug.
+	 * @return string
+	 */
+	private static function shelf_sort( $shelf ) {
+		return ( $shelf === 'read' ) ? 'date_read' : 'date_added';
+	}
 
 	/**
 	 * Plugin activation callback.
@@ -44,76 +92,163 @@ class Goodreads_Feed {
 	}
 
 	/**
-	 * Validates a Goodreads bookshelf RSS feed URL.
+	 * Reads the saved profile, falling back to a legacy RSS URL.
 	 *
-	 * @since 1.0.0
+	 * The legacy URL is only used to recover the user id and shelf.
+	 * Its secret key is never requested.
 	 *
-	 * @param string $url Raw feed URL.
-	 * @return string Sanitized URL, or empty string when invalid.
+	 * @since 1.1.0
+	 *
+	 * @return array{user_id:string,shelf:string}
 	 */
-	public static function validate_feed_url( $url ) {
-		$url = esc_url_raw( trim( (string) $url ) );
-		if ( $url === '' ) {
-			return '';
+	public static function resolve_settings() {
+		$user_id      = self::sanitize_user_id( (string) get_option( self::OPT_USER_ID, '' ) );
+		$stored_shelf = get_option( self::OPT_SHELF, null );
+		$shelf        = is_string( $stored_shelf ) ? self::sanitize_shelf( $stored_shelf ) : '';
+
+		if ( $user_id === '' ) {
+			$legacy  = self::parse_profile_input( (string) get_option( self::OPT_LEGACY_FEED_URL, '' ) );
+			$user_id = $legacy['id'];
+			if ( $shelf === '' && $legacy['shelf'] !== '' ) {
+				$shelf = $legacy['shelf'];
+			}
 		}
 
-		$parts = wp_parse_url( $url );
+		if ( $shelf === '' ) {
+			$shelf = 'read';
+		}
+
+		return array(
+			'user_id' => $user_id,
+			'shelf'   => $shelf,
+		);
+	}
+
+	/**
+	 * Accepts a numeric id, a profile URL, or a legacy RSS URL.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @param string $value Raw admin input.
+	 * @return array{id:string,shelf:string}
+	 */
+	public static function parse_profile_input( $value ) {
+		$result = array(
+			'id'    => '',
+			'shelf' => '',
+		);
+		$value  = trim( (string) $value );
+		if ( $value === '' ) {
+			return $result;
+		}
+
+		if ( preg_match( '/^[1-9]\d{0,19}$/', $value ) ) {
+			$result['id'] = $value;
+			return $result;
+		}
+
+		$value = esc_url_raw( $value );
+		if ( $value === '' ) {
+			return $result;
+		}
+
+		$parts = wp_parse_url( $value );
 		if ( ! is_array( $parts ) ) {
-			return '';
+			return $result;
 		}
 
 		$host = isset( $parts['host'] ) ? strtolower( (string) $parts['host'] ) : '';
 		if ( ! in_array( $host, self::ALLOWED_HOSTS, true ) ) {
-			return '';
+			return $result;
+		}
+
+		$scheme = isset( $parts['scheme'] ) ? strtolower( (string) $parts['scheme'] ) : '';
+		if ( $scheme !== 'https' ) {
+			return $result;
 		}
 
 		$path = isset( $parts['path'] ) ? (string) $parts['path'] : '';
-		if ( ! preg_match( '#^/review/list_rss/\d+/?$#', $path ) ) {
-			return '';
+		if ( preg_match( '#/(?:user/show|review/list_rss|review/list|review/custom_widget|review/grid_widget)/(\d+)#', $path, $matches ) ) {
+			$result['id'] = $matches[1];
 		}
 
-		$query = array();
 		if ( ! empty( $parts['query'] ) ) {
+			$query = array();
 			parse_str( (string) $parts['query'], $query );
+			if ( ! empty( $query['shelf'] ) && is_string( $query['shelf'] ) ) {
+				$result['shelf'] = self::sanitize_shelf( $query['shelf'] );
+			}
 		}
 
-		if ( empty( $query['key'] ) || ! is_string( $query['key'] ) ) {
-			return '';
-		}
-
-		$scheme = isset( $parts['scheme'] ) ? strtolower( (string) $parts['scheme'] ) : 'https';
-		if ( $scheme !== 'https' ) {
-			return '';
-		}
-
-		return $url;
+		return $result;
 	}
 
 	/**
-	 * Returns parsed books from a Goodreads RSS feed URL.
+	 * Reduces profile input to a numeric Goodreads user id.
 	 *
-	 * @since 1.0.0
+	 * @since 1.1.0
 	 *
-	 * @param string $feed_url Valid Goodreads RSS feed URL.
-	 * @param int    $count    Maximum number of books to return.
-	 * @return array<int, array{title:string,author:string,year:int,rating:float,cover:?string,link:string}>
+	 * @param string $value Raw user id or Goodreads URL.
+	 * @return string
 	 */
-	public static function get_books( $feed_url, $count ) {
-		$feed_url = self::validate_feed_url( $feed_url );
-		if ( $feed_url === '' ) {
+	public static function sanitize_user_id( $value ) {
+		$parsed = self::parse_profile_input( $value );
+		return $parsed['id'];
+	}
+
+	/**
+	 * Normalizes a Goodreads shelf slug.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @param string $shelf    Raw shelf slug.
+	 * @param string $fallback Value used when the slug is empty or invalid.
+	 * @return string
+	 */
+	public static function sanitize_shelf( $shelf, $fallback = '' ) {
+		$shelf = strtolower( trim( (string) $shelf ) );
+		$shelf = preg_replace( '/\s+/', '-', $shelf );
+		if ( ! is_string( $shelf ) || ! preg_match( '/^[a-z0-9][a-z0-9_-]{0,49}$/', $shelf ) ) {
+			return $fallback;
+		}
+
+		return $shelf;
+	}
+
+	/**
+	 * Returns books for a public Goodreads shelf.
+	 *
+	 * A transport or parse failure returns null so the caller can tell it
+	 * apart from a shelf that simply has no books. Failures are not cached.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @param string $user_id Numeric Goodreads user id.
+	 * @param string $shelf   Shelf slug, for example read or currently-reading.
+	 * @param int    $count   Maximum number of books to return.
+	 * @return array<int, array{title:string,author:string,year:int,rating:float,cover:?string,link:string}>|null
+	 */
+	public static function get_books( $user_id, $shelf, $count ) {
+		$user_id = self::sanitize_user_id( $user_id );
+		$shelf   = self::sanitize_shelf( $shelf );
+		$count   = self::sanitize_count( $count );
+		if ( $user_id === '' || $shelf === '' ) {
 			return array();
 		}
 
-		$count     = self::sanitize_count( $count );
-		$cache_key = self::TRANSIENT_PREFIX . md5( $feed_url );
-
-		$cached = get_transient( $cache_key );
+		$cache_key = self::TRANSIENT_PREFIX . md5( $user_id . '|' . $shelf );
+		$cached    = get_transient( $cache_key );
 		if ( is_array( $cached ) ) {
 			return array_slice( $cached, 0, $count );
 		}
 
-		$books = self::fetch_books( $feed_url );
-		set_transient( $cache_key, $books, GOODREADS_RSS_WIDGET_CACHE_SECONDS );
+		$books = self::fetch_books( $user_id, $shelf );
+		if ( ! is_array( $books ) ) {
+			return null;
+		}
+
+		$ttl = empty( $books ) ? HOUR_IN_SECONDS : GOODREADS_RSS_WIDGET_CACHE_SECONDS;
+		set_transient( $cache_key, $books, $ttl );
 
 		return array_slice( $books, 0, $count );
 	}
@@ -138,189 +273,223 @@ class Goodreads_Feed {
 	}
 
 	/**
-	 * Fetches books from the Goodreads RSS feed.
+	 * Downloads and parses the official Goodreads shelf widget.
 	 *
-	 * @since 1.0.0
+	 * @since 1.1.0
 	 *
-	 * @param string $feed_url Valid feed URL.
-	 * @return array<int, array{title:string,author:string,year:int,rating:float,cover:?string,link:string}>
+	 * @param string $user_id Numeric Goodreads user id.
+	 * @param string $shelf   Valid shelf slug.
+	 * @return array<int, array{title:string,author:string,year:int,rating:float,cover:?string,link:string}>|null
 	 */
-	private static function fetch_books( $feed_url ) {
-		require_once ABSPATH . WPINC . '/feed.php';
+	private static function fetch_books( $user_id, $shelf ) {
+		$url      = self::widget_url( $user_id, $shelf );
+		$response = wp_remote_get(
+			$url,
+			array(
+				'timeout'     => 15,
+				'redirection' => 2,
+				'user-agent'  => 'WordPress/' . get_bloginfo( 'version' ) . '; ' . home_url( '/' ),
+			)
+		);
 
-		$feed = fetch_feed( $feed_url );
-		if ( is_wp_error( $feed ) ) {
-			return array();
+		if ( is_wp_error( $response ) ) {
+			return null;
 		}
 
-		$maxitems = $feed->get_item_quantity();
-		if ( ! is_int( $maxitems ) || $maxitems < 1 ) {
-			$maxitems = 10;
+		$code = (int) wp_remote_retrieve_response_code( $response );
+		if ( $code !== 200 ) {
+			return null;
 		}
 
-		$items = $feed->get_items( 0, $maxitems );
-		if ( empty( $items ) ) {
-			return array();
+		return self::parse_widget_response( (string) wp_remote_retrieve_body( $response ) );
+	}
+
+	/**
+	 * Builds the shelf widget URL for a public profile.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @param string $user_id Numeric Goodreads user id.
+	 * @param string $shelf   Valid shelf slug.
+	 * @return string
+	 */
+	private static function widget_url( $user_id, $shelf ) {
+		$query = array(
+			'num_books'    => GOODREADS_RSS_WIDGET_MAX_COUNT,
+			'order'        => 'd',
+			'shelf'        => $shelf,
+			'show_author'  => 1,
+			'show_cover'   => 1,
+			'show_rating'  => 1,
+			'show_review'  => 0,
+			'show_title'   => 1,
+			'sort'         => self::shelf_sort( $shelf ),
+			'widget_id'    => self::widget_id( $shelf ),
+		);
+
+		return 'https://www.goodreads.com/review/custom_widget/' . $user_id . '?' . http_build_query( $query, '', '&', PHP_QUERY_RFC3986 );
+	}
+
+	/**
+	 * Parses the JavaScript payload returned by the shelf widget.
+	 *
+	 * The publication year is not part of this payload, so it is stored as 0
+	 * and the template omits it.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @param string $body Raw widget response.
+	 * @return array<int, array{title:string,author:string,year:int,rating:float,cover:?string,link:string}>|null
+	 */
+	private static function parse_widget_response( $body ) {
+		if ( ! preg_match( "/var widget_code = '(.*)'\\s*;?\\s*var widget_div/s", $body, $matches ) ) {
+			return null;
 		}
 
-		$out = array();
-		foreach ( $items as $item ) {
-			$title       = method_exists( $item, 'get_title' ) ? (string) $item->get_title() : '';
-			$link        = method_exists( $item, 'get_link' ) ? (string) $item->get_link() : '';
-			$description = method_exists( $item, 'get_description' ) ? (string) $item->get_description() : '';
+		$html = stripcslashes( $matches[1] );
+		if ( $html === '' ) {
+			return null;
+		}
 
-			$author = self::get_item_tag( $item, 'author_name' );
-			$year   = self::get_item_tag( $item, 'book_published' );
-			$rating = self::get_item_tag( $item, 'user_rating' );
-			$cover  = self::get_item_tag( $item, 'book_medium_image_url' );
+		$previous = libxml_use_internal_errors( true );
+		$document = new DOMDocument();
+		$loaded   = $document->loadHTML( '<?xml encoding="utf-8">' . $html );
+		libxml_clear_errors();
+		libxml_use_internal_errors( $previous );
 
-			if ( $cover === '' ) {
-				$cover = self::get_item_tag( $item, 'book_image_url' );
-			}
-			if ( $cover === '' ) {
-				$cover = self::extract_cover_src( $description );
-			}
-			if ( $author === '' ) {
-				$author = self::extract_description_field( $description, 'author' );
+		if ( ! $loaded ) {
+			return null;
+		}
+
+		$xpath = new DOMXPath( $document );
+		$nodes = $xpath->query( '//div[contains(concat(" ", normalize-space(@class), " "), " gr_custom_each_container_")]' );
+		if ( ! $nodes instanceof DOMNodeList ) {
+			return null;
+		}
+
+		$books = array();
+		foreach ( $nodes as $node ) {
+			if ( ! $node instanceof DOMElement ) {
+				continue;
 			}
 
-			$out[] = array(
-				'title'  => html_entity_decode( trim( $title ), ENT_QUOTES | ENT_HTML5, 'UTF-8' ),
-				'author' => html_entity_decode( trim( $author ), ENT_QUOTES | ENT_HTML5, 'UTF-8' ),
-				'year'   => absint( $year ),
-				'rating' => self::parse_rating( $rating ),
-				'cover'  => $cover !== '' ? $cover : null,
+			$title = self::node_text( $xpath, $node, './/div[contains(concat(" ", normalize-space(@class), " "), " gr_custom_title_")]//a' );
+			if ( $title === '' ) {
+				continue;
+			}
+
+			$author = self::node_text( $xpath, $node, './/div[contains(concat(" ", normalize-space(@class), " "), " gr_custom_author_")]//a' );
+			$cover  = self::normalize_cover( self::node_attribute( $xpath, $node, './/div[contains(concat(" ", normalize-space(@class), " "), " gr_custom_book_container_")]//img', 'src' ) );
+			$link   = self::book_link( $cover, self::node_attribute( $xpath, $node, './/div[contains(concat(" ", normalize-space(@class), " "), " gr_custom_title_")]//a', 'href' ) );
+			$stars  = $xpath->query( './/img[contains(@src, "gr_flat_red_star_active")]', $node );
+
+			$books[] = array(
+				'title'  => $title,
+				'author' => $author,
+				'year'   => 0,
+				'rating' => ( $stars instanceof DOMNodeList ) ? (float) min( 5, $stars->length ) : 0.0,
+				'cover'  => $cover,
 				'link'   => $link,
 			);
 		}
 
-		return $out;
+		return $books;
 	}
 
 	/**
-	 * Reads a child tag from a Goodreads RSS item.
+	 * Reads trimmed text from the first node matched by an XPath query.
 	 *
-	 * @since 1.0.0
+	 * @since 1.1.0
 	 *
-	 * @param object $item SimplePie feed item.
-	 * @param string $tag  Tag name.
+	 * @param DOMXPath   $xpath XPath bound to the widget document.
+	 * @param DOMElement $node  Book container.
+	 * @param string     $query Relative XPath.
 	 * @return string
 	 */
-	private static function get_item_tag( $item, $tag ) {
-		if ( ! method_exists( $item, 'get_item_tags' ) ) {
+	private static function node_text( $xpath, $node, $query ) {
+		$found = $xpath->query( $query, $node );
+		if ( ! $found instanceof DOMNodeList || $found->length < 1 ) {
 			return '';
 		}
 
-		$namespaces = array( '', 'http://backend.userland.com/rss2' );
-		foreach ( $namespaces as $namespace ) {
-			$tags = $item->get_item_tags( $namespace, $tag );
-			if ( empty( $tags ) || ! is_array( $tags ) ) {
-				continue;
-			}
-
-			$first = $tags[0];
-			if ( is_array( $first ) && isset( $first['data'] ) ) {
-				return trim( (string) $first['data'] );
-			}
-			if ( is_string( $first ) ) {
-				return trim( $first );
-			}
-		}
-
-		return '';
+		$text = html_entity_decode( (string) $found->item( 0 )->textContent, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+		$text = preg_replace( '/\s+/u', ' ', trim( $text ) );
+		return is_string( $text ) ? $text : '';
 	}
 
 	/**
-	 * Normalizes a Goodreads user rating.
+	 * Reads an attribute from the first node matched by an XPath query.
 	 *
-	 * @since 1.0.0
+	 * @since 1.1.0
 	 *
-	 * @param string $rating Raw rating value.
-	 * @return float
-	 */
-	private static function parse_rating( $rating ) {
-		$rating = floatval( str_replace( ',', '.', trim( (string) $rating ) ) );
-		if ( $rating <= 0 ) {
-			return 0.0;
-		}
-		if ( $rating > 5 ) {
-			return 5.0;
-		}
-		return $rating;
-	}
-
-	/**
-	 * Extracts a cover image URL from the RSS description HTML.
-	 *
-	 * @since 1.0.0
-	 *
-	 * @param string $description RSS item description.
+	 * @param DOMXPath   $xpath     XPath bound to the widget document.
+	 * @param DOMElement $node      Book container.
+	 * @param string     $query     Relative XPath.
+	 * @param string     $attribute Attribute name.
 	 * @return string
 	 */
-	private static function extract_cover_src( $description ) {
-		if ( $description === '' ) {
+	private static function node_attribute( $xpath, $node, $query, $attribute ) {
+		$found = $xpath->query( $query, $node );
+		if ( ! $found instanceof DOMNodeList || $found->length < 1 || ! $found->item( 0 ) instanceof DOMElement ) {
 			return '';
 		}
 
-		if ( preg_match( '/<img[^>]+src=[\'"]([^\'"]+)[\'"]/i', $description, $matches ) ) {
-			return trim( (string) $matches[1] );
-		}
-
-		return '';
+		return trim( (string) $found->item( 0 )->getAttribute( $attribute ) );
 	}
 
 	/**
-	 * Extracts a labeled field from the Goodreads description block.
+	 * Keeps a Goodreads cover URL and asks for a larger size.
 	 *
-	 * @since 1.0.0
+	 * @since 1.1.0
 	 *
-	 * @param string $description RSS item description.
-	 * @param string $field       Field label, e.g. "author".
-	 * @return string
+	 * @param string $src Raw image URL.
+	 * @return string|null
 	 */
-	private static function extract_description_field( $description, $field ) {
-		if ( $description === '' ) {
-			return '';
+	private static function normalize_cover( $src ) {
+		$src = trim( html_entity_decode( (string) $src, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) );
+		if ( strpos( $src, '//' ) === 0 ) {
+			$src = 'https:' . $src;
+		}
+		if ( strpos( $src, 'https://' ) !== 0 ) {
+			return null;
 		}
 
-		$pattern = '/\b' . preg_quote( $field, '/' ) . ':\s*([^<]+)/i';
-		if ( preg_match( $pattern, $description, $matches ) ) {
-			return trim( html_entity_decode( (string) $matches[1], ENT_QUOTES | ENT_HTML5, 'UTF-8' ) );
+		$host = strtolower( (string) wp_parse_url( $src, PHP_URL_HOST ) );
+		if ( ! in_array( $host, array( 'i.gr-assets.com', 'images.gr-assets.com', 's.gr-assets.com' ), true ) ) {
+			return null;
 		}
 
-		return '';
+		$src = preg_replace( '/\._S[XY]\d+_\./', '._SX200_.', $src );
+		return is_string( $src ) ? $src : null;
 	}
 
 	/**
-	 * Returns a feed URL with the secret key redacted for display.
+	 * Builds a public book URL from the cover, or keeps a Goodreads review link.
 	 *
-	 * @since 1.0.0
+	 * @since 1.1.0
 	 *
-	 * @param string $feed_url Valid feed URL.
+	 * @param string|null $cover Cover URL, already normalized.
+	 * @param string      $href  Title link from the widget.
 	 * @return string
 	 */
-	public static function redact_feed_url( $feed_url ) {
-		$feed_url = self::validate_feed_url( $feed_url );
-		if ( $feed_url === '' ) {
+	private static function book_link( $cover, $href ) {
+		if ( is_string( $cover ) && preg_match( '#/(\d+)\._S[XY]\d+_\.#', $cover, $matches ) ) {
+			return 'https://www.goodreads.com/book/show/' . $matches[1];
+		}
+
+		$href = trim( html_entity_decode( (string) $href, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) );
+		$parts = wp_parse_url( $href );
+		if ( ! is_array( $parts ) ) {
 			return '';
 		}
 
-		$parts = wp_parse_url( $feed_url );
-		if ( ! is_array( $parts ) || empty( $parts['query'] ) ) {
-			return $feed_url;
+		$host = isset( $parts['host'] ) ? strtolower( (string) $parts['host'] ) : '';
+		$path = isset( $parts['path'] ) ? (string) $parts['path'] : '';
+		if ( ! in_array( $host, self::ALLOWED_HOSTS, true ) || ! preg_match( '#^/(?:book/show|review/show)/\d+#', $path ) ) {
+			return '';
 		}
 
-		$query = array();
-		parse_str( (string) $parts['query'], $query );
-		if ( isset( $query['key'] ) ) {
-			$query['key'] = '***';
-		}
-
-		$scheme = isset( $parts['scheme'] ) ? $parts['scheme'] : 'https';
-		$host   = isset( $parts['host'] ) ? $parts['host'] : 'www.goodreads.com';
-		$path   = isset( $parts['path'] ) ? $parts['path'] : '';
-
-		return $scheme . '://' . $host . $path . '?' . http_build_query( $query, '', '&', PHP_QUERY_RFC3986 );
+		return 'https://www.goodreads.com' . $path;
 	}
 
 	/**

@@ -17,9 +17,6 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 class Goodreads_Shortcode {
 
-	/** @var string Option name for the Goodreads RSS feed URL. */
-	const OPT_FEED_URL = 'goodreads_feed_url';
-
 	/** @var string Option name for the default book count. */
 	const OPT_COUNT = 'goodreads_default_count';
 
@@ -38,8 +35,7 @@ class Goodreads_Shortcode {
 	 *
 	 * Supported attributes:
 	 * - count: number of books to display (1-50).
-	 *
-	 * The feed URL is read only from admin settings to avoid exposing the secret key.
+	 * - shelf: shelf slug, overriding the admin setting.
 	 *
 	 * @since 1.0.0
 	 *
@@ -50,13 +46,18 @@ class Goodreads_Shortcode {
 		$atts = shortcode_atts(
 			array(
 				'count' => '',
+				'shelf' => '',
 			),
 			(array) $atts,
 			'goodreads'
 		);
 
-		$feed_url = (string) get_option( self::OPT_FEED_URL, '' );
+		$settings = Goodreads_Feed::resolve_settings();
 		$count    = isset( $atts['count'] ) ? $atts['count'] : '';
+		$shelf    = Goodreads_Feed::sanitize_shelf( isset( $atts['shelf'] ) ? (string) $atts['shelf'] : '' );
+		if ( $shelf === '' ) {
+			$shelf = $settings['shelf'];
+		}
 
 		if ( $count === '' || $count === null ) {
 			$count = (int) get_option( self::OPT_COUNT, 10 );
@@ -79,13 +80,16 @@ class Goodreads_Shortcode {
 			);
 		}
 
-		if ( Goodreads_Feed::validate_feed_url( $feed_url ) === '' ) {
-			return '<div class="goodreads-error">' . esc_html__( 'Imposta un URL RSS Goodreads valido nelle impostazioni del plugin.', 'goodreads-rss-widget' ) . '</div>';
+		if ( $settings['user_id'] === '' ) {
+			return '<div class="goodreads-error">' . esc_html__( 'Indica l\'ID del profilo Goodreads nelle impostazioni del plugin.', 'goodreads-rss-widget' ) . '</div>';
 		}
 
-		$books = Goodreads_Feed::get_books( $feed_url, $count );
-		if ( empty( $books ) ) {
-			return '<div class="goodreads-error">' . esc_html__( 'Feed non disponibile.', 'goodreads-rss-widget' ) . '</div>';
+		$books = Goodreads_Feed::get_books( $settings['user_id'], $shelf, $count );
+		if ( ! is_array( $books ) ) {
+			return '<div class="goodreads-error">' . esc_html__( 'Scaffale Goodreads non disponibile.', 'goodreads-rss-widget' ) . '</div>';
+		}
+		if ( $books === array() ) {
+			return '<div class="goodreads-error">' . esc_html__( 'Nessun libro su questo scaffale.', 'goodreads-rss-widget' ) . '</div>';
 		}
 
 		ob_start();
